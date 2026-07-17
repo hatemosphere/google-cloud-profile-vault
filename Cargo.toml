@@ -1,0 +1,36 @@
+[package]
+name = "gcpv"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Named Google Cloud profiles backed by the OS keychain"
+publish = false
+
+[dependencies]
+anyhow = "1.0.103"
+clap = { version = "4.6.2", features = ["derive"] }
+google-cloud-auth = "1.14.0"
+keyring = "4.1.5"
+oauth2 = "5.0.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tempfile = "3.27.0"
+tokio = { version = "1.53.0", features = ["macros", "rt"] }
+toml = "1.1.3"
+url = "2.5.8"
+webbrowser = "1.0.6"
+zeroize = "1.8.2"
+
+[target."cfg(unix)".dependencies]
+rustix = { version = "1.1.4", features = ["process"] }
+signal-hook = "0.3.18"
+
+[target.'cfg(windows)'.dependencies]
+ctrlc = "3.5.0"
+
+[profile.release]
+strip = true
+lto = "thin"
+
+[lints.rust]
+unsafe_code = "forbid"
