@@ -173,8 +173,8 @@ name. `list` distinguishes a missing entry from a keychain access failure.
 
 ## Troubleshooting
 
-Set `GCPV_LOG=debug` to show credential flow, browser-profile selection, and
-provider errors on stderr:
+Set `GCPV_LOG=debug` to show credential flow and browser-profile selection on
+stderr:
 
 ```console
 GCPV_LOG=debug gcpv exec work -- gcloud projects list

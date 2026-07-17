@@ -101,11 +101,51 @@ impl MintError {
             source = error.source();
         }
         let normalized = details.to_ascii_lowercase();
+        let rejection = compact_oauth_rejection(&details).or_else(|| {
+            normalized
+                .contains("invalid_rapt")
+                .then(|| "invalid_grant (invalid_rapt)".to_owned())
+                .or_else(|| {
+                    normalized
+                        .contains("invalid_grant")
+                        .then(|| "invalid_grant".to_owned())
+                })
+        });
         Self {
-            message: format!("{context}: {details}"),
-            rejected: normalized.contains("invalid_grant") || normalized.contains("invalid_rapt"),
+            message: format!("{context}: {}", rejection.as_deref().unwrap_or(&details)),
+            rejected: rejection.is_some(),
         }
     }
+}
+
+fn compact_oauth_rejection(details: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Response {
+        error: String,
+        error_description: Option<String>,
+        error_subtype: Option<String>,
+    }
+
+    let start = details.find("body=<")? + "body=<".len();
+    let end = start + details[start..].find('>')?;
+    let response: Response = serde_json::from_str(&details[start..end]).ok()?;
+    if response.error != "invalid_grant"
+        && response.error_subtype.as_deref() != Some("invalid_rapt")
+    {
+        return None;
+    }
+
+    let mut message = response.error;
+    if let Some(subtype) = response.error_subtype {
+        message.push_str(" (");
+        message.push_str(&subtype);
+        message.push(')');
+    }
+    if let Some(description) = response.error_description {
+        message.push_str(": ");
+        message.push_str(description.trim());
+    }
+    Some(message)
 }
 
 impl fmt::Display for MintError {
@@ -203,6 +243,37 @@ mod tests {
         let transient = MintError::new("mint", &ErrorMessage("connection reset"));
         assert!(rejected.credentials_rejected());
         assert!(!transient.credentials_rejected());
+    }
+
+    #[test]
+    fn oauth_rejection_output_keeps_the_provider_reason_without_sdk_repetition() {
+        let error = ErrorMessage(
+            r#"wrapper body=<{
+                "error": "invalid_grant",
+                "error_description": "Token has been expired or revoked."
+            }> repeated wrapper invalid_grant"#,
+        );
+        let rejected = MintError::new("mint", &error);
+        assert_eq!(
+            rejected.to_string(),
+            "mint: invalid_grant: Token has been expired or revoked."
+        );
+    }
+
+    #[test]
+    fn oauth_rejection_output_preserves_the_rapt_subtype() {
+        let error = ErrorMessage(
+            r#"body=<{
+                "error": "invalid_grant",
+                "error_description": "reauth related error",
+                "error_subtype": "invalid_rapt"
+            }>"#,
+        );
+        let rejected = MintError::new("mint", &error);
+        assert_eq!(
+            rejected.to_string(),
+            "mint: invalid_grant (invalid_rapt): reauth related error"
+        );
     }
 
     #[test]

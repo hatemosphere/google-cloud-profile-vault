@@ -152,13 +152,7 @@ async fn mint_access_token(
     crate::diagnostics::debug(format_args!(
         "profile '{name}': minting {kind} access token"
     ));
-    let result = credentials::mint(profile, refresh_token).await;
-    if let Err(error) = &result {
-        crate::diagnostics::debug(format_args!(
-            "profile '{name}': access-token mint failed: {error}"
-        ));
-    }
-    result
+    credentials::mint(profile, refresh_token).await
 }
 
 async fn login(
