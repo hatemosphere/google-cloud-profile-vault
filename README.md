@@ -1,4 +1,4 @@
-# gcpv
+# gcpv — Google Cloud Profile Vault
 
 **Named Google Cloud credentials without global auth-state roulette.**
 
@@ -43,7 +43,7 @@ gcpv list
 Requires Rust 1.97 or newer.
 
 ```console
-cargo install --git https://github.com/hatemosphere/google-cloud-credentials-vault --locked
+cargo install --git https://github.com/hatemosphere/google-cloud-profile-vault --locked
 ```
 
 ## Make gcpv the only local auth source

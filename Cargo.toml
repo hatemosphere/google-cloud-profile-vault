@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
 description = "Named Google Cloud profiles backed by the OS keychain"
+repository = "https://github.com/hatemosphere/google-cloud-profile-vault"
 publish = false
 
 [dependencies]
