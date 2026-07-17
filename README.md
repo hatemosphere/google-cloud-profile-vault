@@ -1,8 +1,33 @@
 # gcpv
 
-`gcpv` runs commands with named Google Cloud profiles, in the style of
-`aws-vault`. OAuth refresh tokens live in the operating-system keychain;
-profile metadata is stored separately in TOML.
+**Named Google Cloud credentials without global auth-state roulette.**
+
+`gcpv` is a small, `aws-vault`-style wrapper for running commands with an
+isolated Google account, project, scopes, and optional service-account
+impersonation.
+
+## Why gcpv?
+
+- **Keychain-backed at rest.** `gcloud auth application-default login` creates a
+  well-known JSON file containing a reusable refresh token. gcpv keeps that
+  token in macOS Keychain, Windows Credential Manager, or Secret Service and
+  materializes a restricted temporary ADC file for the child command.
+- **No global account or ADC switching.** The gcloud CLI credential store and
+  local ADC are separate, and changing a gcloud configuration does not switch
+  ADC. A gcpv profile supplies both to one process tree without activating a
+  global gcloud configuration or overwriting the well-known ADC file.
+- **The right browser and the right identity.** gcpv can match an account to its
+  signed-in Chrome profile, accepts an explicit profile override, and verifies
+  both the returned email and stable Google subject before storing credentials.
+- **Useful for real development workflows.** Child processes receive a fresh
+  gcloud access token plus renewable ADC for Terraform and Google client
+  libraries. Competing credential variables are scrubbed first.
+
+Google documents both the [refresh token stored in local ADC][local-adc] and
+the fact that [gcloud configurations do not switch local ADC][adc-search].
+
+[local-adc]: https://cloud.google.com/docs/authentication/set-up-adc-local-dev-environment#user-credentials
+[adc-search]: https://cloud.google.com/docs/authentication/application-default-credentials
 
 ```console
 gcpv add work --account you@corp.com --project my-project
@@ -26,7 +51,7 @@ cargo install --git https://github.com/hatemosphere/google-cloud-credentials-vau
 | Command | Purpose |
 |---|---|
 | `gcpv add NAME [OPTIONS]` | Create and authenticate a profile |
-| `gcpv login NAME` | Re-authenticate an existing profile |
+| `gcpv login NAME [--browser-profile DIR_OR_EMAIL]` | Re-authenticate a profile |
 | `gcpv exec NAME [-- COMMAND...]` | Run a command, or start `$SHELL` |
 | `gcpv token NAME` | Print a fresh access token |
 | `gcpv list` / `gcpv ls` | List profiles and credential status |
@@ -97,14 +122,24 @@ injected gcloud access token already belongs to the service account.
 
 ## Chrome profiles
 
-`--browser-profile` is explicit; gcpv does not infer a browser profile from the
-configured account. The value can be either a known Chrome profile directory,
-such as `Profile 2`, or an email found in Chrome's `Local State` file. Unknown
+`--browser-profile` can be either a known Chrome profile directory, such as
+`Profile 2`, or an email found in Chrome's `Local State` file. Explicit unknown
 directories and emails are rejected before Chrome is started.
 
-Without this option, gcpv opens the system browser and supplies Google's
-`login_hint` when an account is configured. If the browser cannot be started,
-the authorization URL remains available for manual opening.
+```console
+gcpv add work --account you@corp.com --browser-profile 'Profile 2'
+gcpv login work --browser-profile you@corp.com
+```
+
+To find the directory name, open `chrome://version` in the intended Chrome
+profile and use the final component of **Profile Path** (`Default`, `Profile 2`,
+and so on). A `login` override is saved only after authentication succeeds and
+the returned Google identity is verified.
+
+Without this option, gcpv tries to match `--account` to a signed-in Chrome
+profile. If no match is available, it opens the system browser and supplies
+Google's `login_hint`. If the browser cannot be started, the authorization URL
+remains available for manual opening.
 
 ## Configuration
 
@@ -135,6 +170,24 @@ Unknown or invalid profile values are reported when the file is loaded.
 
 Refresh tokens use keychain service `gcpv`, with the profile name as the entry
 name. `list` distinguishes a missing entry from a keychain access failure.
+
+## Troubleshooting
+
+Set `GCPV_LOG=debug` to show credential flow, browser-profile selection, and
+provider errors on stderr:
+
+```console
+GCPV_LOG=debug gcpv exec work -- gcloud projects list
+```
+
+Debug messages do not include access or refresh token values. Credential
+rejections include Google's response even when debug logging is disabled.
+`Rejected` means Google's token endpoint returned `invalid_grant` or
+`invalid_rapt`; it is not inferred from credential age. Google documents
+[revocation, token limits, and Workspace session controls][refresh-expiration]
+as possible causes.
+
+[refresh-expiration]: https://developers.google.com/identity/protocols/oauth2#expiration
 
 ## Security model
 

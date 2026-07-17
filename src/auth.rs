@@ -109,6 +109,9 @@ pub async fn login(
     })
     .await
     .context("OAuth callback task failed")??;
+    crate::diagnostics::debug(format_args!(
+        "OAuth callback accepted; exchanging authorization code"
+    ));
 
     let http = oauth2::reqwest::ClientBuilder::new()
         .redirect(oauth2::reqwest::redirect::Policy::none())
@@ -126,6 +129,9 @@ pub async fn login(
         .refresh_token()
         .ok_or_else(|| anyhow!("Google returned no refresh token"))?;
     let identity = fetch_identity(&http, token.access_token().secret()).await?;
+    crate::diagnostics::debug(format_args!(
+        "token exchange and Google identity verification succeeded"
+    ));
 
     Ok(Login {
         refresh_token: SecretString::new(refresh_token.secret()),

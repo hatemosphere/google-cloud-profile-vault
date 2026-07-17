@@ -39,7 +39,12 @@ pub enum Command {
         browser_profile: Option<String>,
     },
     /// Re-authenticate a profile
-    Login { name: ProfileName },
+    Login {
+        name: ProfileName,
+        /// Chrome profile directory or signed-in email; saved after successful login
+        #[arg(long, value_name = "DIR_OR_EMAIL")]
+        browser_profile: Option<String>,
+    },
     /// List profiles
     #[command(visible_alias = "ls")]
     List,
@@ -91,6 +96,21 @@ mod tests {
             Cli::try_parse_from(["gcpv", "rm", "work"]).unwrap().command,
             Command::Remove { .. }
         ));
+    }
+
+    #[test]
+    fn login_accepts_an_explicit_browser_profile() {
+        let cli = Cli::try_parse_from(["gcpv", "login", "work", "--browser-profile", "Profile 2"])
+            .unwrap();
+        let Command::Login {
+            name,
+            browser_profile,
+        } = cli.command
+        else {
+            panic!("expected login command");
+        };
+        assert_eq!(name.as_str(), "work");
+        assert_eq!(browser_profile.as_deref(), Some("Profile 2"));
     }
 
     #[test]

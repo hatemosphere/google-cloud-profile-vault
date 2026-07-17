@@ -4,6 +4,7 @@ mod chrome;
 mod cli;
 mod config;
 mod credentials;
+mod diagnostics;
 mod keychain;
 mod process;
 mod secret;

@@ -46,11 +46,14 @@ async fn run_with_store(cli: Cli, store: &ConfigStore) -> Result<u8> {
             eprintln!(
                 "Created profile '{name}'. If authentication is interrupted, resume with `gcpv login {name}`."
             );
-            login(&name, store).await?;
+            login(&name, store, None).await?;
             Ok(0)
         }
-        Command::Login { name } => {
-            login(&name, store).await?;
+        Command::Login {
+            name,
+            browser_profile,
+        } => {
+            login(&name, store, browser_profile.as_deref()).await?;
             Ok(0)
         }
         Command::List => {
@@ -111,22 +114,22 @@ async fn credentials_for(
         Some(token) => token,
         None if interactive => {
             eprintln!("No credentials for profile '{name}'; starting login.");
-            login(name, store).await?;
+            login(name, store, None).await?;
             profile = load_profile(store, name)?;
             keychain::refresh_token(name)?.context("login did not store a refresh token")?
         }
         None => bail!("no credentials for profile '{name}'; run `gcpv login {name}`"),
     };
 
-    match credentials::mint(&profile, &refresh_token).await {
+    match mint_access_token(name, &profile, &refresh_token).await {
         Ok(access_token) => Ok((profile, refresh_token, access_token)),
         Err(error) if error.credentials_rejected() && interactive => {
-            eprintln!("Stored credentials for '{name}' were rejected; re-running login.");
-            login(name, store).await?;
+            eprintln!("Stored credentials for '{name}' were rejected ({error}); re-running login.");
+            login(name, store, None).await?;
             profile = load_profile(store, name)?;
             refresh_token =
                 keychain::refresh_token(name)?.context("login did not store a refresh token")?;
-            let access_token = credentials::mint(&profile, &refresh_token).await?;
+            let access_token = mint_access_token(name, &profile, &refresh_token).await?;
             Ok((profile, refresh_token, access_token))
         }
         Err(error) if error.credentials_rejected() => Err(anyhow::Error::new(error)).context(
@@ -136,14 +139,39 @@ async fn credentials_for(
     }
 }
 
-async fn login(name: &ProfileName, store: &ConfigStore) -> Result<()> {
+async fn mint_access_token(
+    name: &ProfileName,
+    profile: &Profile,
+    refresh_token: &SecretString,
+) -> std::result::Result<AccessToken, credentials::MintError> {
+    let kind = if profile.impersonate_service_account.is_some() {
+        "impersonated service-account"
+    } else {
+        "user-account"
+    };
+    crate::diagnostics::debug(format_args!(
+        "profile '{name}': minting {kind} access token"
+    ));
+    let result = credentials::mint(profile, refresh_token).await;
+    if let Err(error) = &result {
+        crate::diagnostics::debug(format_args!(
+            "profile '{name}': access-token mint failed: {error}"
+        ));
+    }
+    result
+}
+
+async fn login(
+    name: &ProfileName,
+    store: &ConfigStore,
+    browser_override: Option<&str>,
+) -> Result<()> {
     let before = load_profile(store, name)?;
     let scopes = auth::effective_scopes(before.scopes.as_deref());
-    let chrome_profile = before
-        .browser_profile
-        .as_deref()
-        .map(crate::chrome::resolve)
-        .transpose()?;
+    let chrome_profile = crate::chrome::select_profile(
+        browser_override.or(before.browser_profile.as_deref()),
+        before.account.as_deref(),
+    )?;
     let result = auth::login(
         before.account.as_deref(),
         &scopes,
@@ -164,6 +192,9 @@ async fn login(name: &ProfileName, store: &ConfigStore) -> Result<()> {
         }
         current.account = Some(result.identity.email.clone());
         current.subject = Some(result.identity.subject.clone());
+        if let Some(browser_profile) = browser_override {
+            current.browser_profile = Some(browser_profile.to_owned());
+        }
         Ok(())
     });
     if let Err(save_error) = save_result {
