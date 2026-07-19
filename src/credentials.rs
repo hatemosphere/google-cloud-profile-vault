@@ -84,12 +84,22 @@ impl fmt::Debug for AccessToken {
 #[derive(Debug)]
 pub struct MintError {
     message: String,
-    rejected: bool,
+    rejection: Option<CredentialRejection>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CredentialRejection {
+    InvalidGrant,
+    ReauthenticationRequired,
 }
 
 impl MintError {
     pub fn credentials_rejected(&self) -> bool {
-        self.rejected
+        self.rejection.is_some()
+    }
+
+    pub fn reauthentication_required(&self) -> bool {
+        self.rejection == Some(CredentialRejection::ReauthenticationRequired)
     }
 
     fn new(context: &str, error: &(dyn std::error::Error + 'static)) -> Self {
@@ -102,23 +112,34 @@ impl MintError {
         }
         let normalized = details.to_ascii_lowercase();
         let rejection = compact_oauth_rejection(&details).or_else(|| {
-            normalized
-                .contains("invalid_rapt")
-                .then(|| "invalid_grant (invalid_rapt)".to_owned())
-                .or_else(|| {
-                    normalized
-                        .contains("invalid_grant")
-                        .then(|| "invalid_grant".to_owned())
-                })
+            if normalized.contains("invalid_rapt") {
+                Some((
+                    "invalid_grant (invalid_rapt)".to_owned(),
+                    CredentialRejection::ReauthenticationRequired,
+                ))
+            } else if normalized.contains("invalid_grant") {
+                Some((
+                    "invalid_grant".to_owned(),
+                    CredentialRejection::InvalidGrant,
+                ))
+            } else {
+                None
+            }
         });
         Self {
-            message: format!("{context}: {}", rejection.as_deref().unwrap_or(&details)),
-            rejected: rejection.is_some(),
+            message: format!(
+                "{context}: {}",
+                rejection
+                    .as_ref()
+                    .map(|(message, _)| message.as_str())
+                    .unwrap_or(&details)
+            ),
+            rejection: rejection.map(|(_, reason)| reason),
         }
     }
 }
 
-fn compact_oauth_rejection(details: &str) -> Option<String> {
+fn compact_oauth_rejection(details: &str) -> Option<(String, CredentialRejection)> {
     #[derive(serde::Deserialize)]
     struct Response {
         error: String,
@@ -136,16 +157,21 @@ fn compact_oauth_rejection(details: &str) -> Option<String> {
     }
 
     let mut message = response.error;
-    if let Some(subtype) = response.error_subtype {
+    if let Some(ref subtype) = response.error_subtype {
         message.push_str(" (");
-        message.push_str(&subtype);
+        message.push_str(subtype);
         message.push(')');
     }
     if let Some(description) = response.error_description {
         message.push_str(": ");
         message.push_str(description.trim());
     }
-    Some(message)
+    let reason = if response.error_subtype.as_deref() == Some("invalid_rapt") {
+        CredentialRejection::ReauthenticationRequired
+    } else {
+        CredentialRejection::InvalidGrant
+    };
+    Some((message, reason))
 }
 
 impl fmt::Display for MintError {
@@ -242,7 +268,9 @@ mod tests {
         let rejected = MintError::new("mint", &ErrorMessage("invalid_grant"));
         let transient = MintError::new("mint", &ErrorMessage("connection reset"));
         assert!(rejected.credentials_rejected());
+        assert!(!rejected.reauthentication_required());
         assert!(!transient.credentials_rejected());
+        assert!(!transient.reauthentication_required());
     }
 
     #[test]
@@ -274,6 +302,7 @@ mod tests {
             rejected.to_string(),
             "mint: invalid_grant (invalid_rapt): reauth related error"
         );
+        assert!(rejected.reauthentication_required());
     }
 
     #[test]

@@ -222,19 +222,25 @@ name. `list` distinguishes a missing entry from a keychain access failure.
 
 ## Troubleshooting
 
-Set `GCPV_LOG=debug` to show credential flow and browser-profile selection on
-stderr:
+Set `GCPV_LOG=debug` to show credential flow, browser-profile selection, and
+the provider reason when stored credentials are rejected on stderr:
 
 ```console
 GCPV_LOG=debug gcpv exec work -- gcloud projects list
 ```
 
-Debug messages do not include access or refresh token values. Credential
-rejections include Google's response even when debug logging is disabled.
-`Rejected` means Google's token endpoint returned `invalid_grant` or
-`invalid_rapt`; it is not inferred from credential age. Google documents
-[revocation, token limits, and Workspace session controls][refresh-expiration]
-as possible causes.
+Debug messages do not include access or refresh token values. During an
+interactive command, a rejected credential automatically starts login without
+printing the provider error. Without a terminal, gcpv exits with the command
+needed to log in instead.
+
+`invalid_rapt` specifically means a Google Workspace session-control policy
+requires reauthentication; it does not mean that the refresh token aged out.
+Google Cloud session durations can be as short as one hour, and gcpv cannot
+extend an administrator's policy. Other `invalid_grant` responses can result
+from revocation, token limits, inactivity, or time-based access. Google
+documents these cases under [refresh-token expiration and Google Cloud session
+controls][refresh-expiration].
 
 [refresh-expiration]: https://developers.google.com/identity/protocols/oauth2#expiration
 

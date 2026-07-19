@@ -124,7 +124,16 @@ async fn credentials_for(
     match mint_access_token(name, &profile, &refresh_token).await {
         Ok(access_token) => Ok((profile, refresh_token, access_token)),
         Err(error) if error.credentials_rejected() && interactive => {
-            eprintln!("Stored credentials for '{name}' were rejected ({error}); re-running login.");
+            crate::diagnostics::debug(format_args!(
+                "profile '{name}': stored credential rejected: {error}"
+            ));
+            if error.reauthentication_required() {
+                eprintln!("Google requires profile '{name}' to sign in again; starting login.");
+            } else {
+                eprintln!(
+                    "Stored credentials for profile '{name}' are no longer valid; starting login."
+                );
+            }
             login(name, store, None).await?;
             profile = load_profile(store, name)?;
             refresh_token =
@@ -132,9 +141,15 @@ async fn credentials_for(
             let access_token = mint_access_token(name, &profile, &refresh_token).await?;
             Ok((profile, refresh_token, access_token))
         }
-        Err(error) if error.credentials_rejected() => Err(anyhow::Error::new(error)).context(
-            format!("credentials expired or were revoked; run `gcpv login {name}`"),
-        ),
+        Err(error) if error.credentials_rejected() => {
+            crate::diagnostics::debug(format_args!(
+                "profile '{name}': stored credential rejected: {error}"
+            ));
+            if error.reauthentication_required() {
+                bail!("Google sign-in required for profile '{name}'; run `gcpv login {name}`");
+            }
+            bail!("credentials expired or were revoked; run `gcpv login {name}`");
+        }
         Err(error) => Err(error.into()),
     }
 }
