@@ -40,7 +40,7 @@ gcpv list
 
 ## Install
 
-Requires Rust 1.97 or newer.
+Requires Rust 1.98 or newer.
 
 ```console
 cargo install --git https://github.com/hatemosphere/google-cloud-profile-vault --locked
@@ -192,7 +192,8 @@ remains available for manual opening.
 
 ## Configuration
 
-Non-secret configuration is stored in `~/.config/gcpv/config.toml`:
+Non-secret configuration is stored in `~/.config/gcpv/config.toml`
+(`$XDG_CONFIG_HOME/gcpv/config.toml` when that variable is set):
 
 ```toml
 [profiles.work]
@@ -256,7 +257,10 @@ controls][refresh-expiration].
   contains the refresh token so ADC clients can renew access tokens. The child
   process can read and copy that long-lived token; only run trusted commands.
 - The ADC file is deleted after normal child termination and after handled
-  `SIGINT`, `SIGTERM`, or `SIGHUP`. No process can clean up after `SIGKILL`, a
+  `SIGINT`, `SIGQUIT`, `SIGTERM`, or `SIGHUP`. Terminal-generated `SIGINT` and
+  `SIGQUIT` already reach the child through the process group and are not
+  relayed a second time; `SIGTERM` and `SIGHUP` sent only to gcpv are relayed
+  to the child. No process can clean up after `SIGKILL`, a
   machine crash, or abrupt power loss, so a stale file can remain in the system
   temporary directory in those cases.
 - On macOS, rebuilding an unsigned binary can cause Keychain authorization

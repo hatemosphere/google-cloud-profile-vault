@@ -2,22 +2,25 @@
 name = "gcpv"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.98"
 description = "Named Google Cloud profiles backed by the OS keychain"
 repository = "https://github.com/hatemosphere/google-cloud-profile-vault"
 publish = false
 
 [dependencies]
 anyhow = "1.0.104"
-clap = { version = "4.6.6", features = ["derive"] }
-google-cloud-auth = "1.15.0"
-keyring = "4.1.6"
-oauth2 = "5.0.0"
+base64 = "0.23.1"
+clap = { version = "4.6.7", features = ["derive"] }
+getrandom = "0.4.3"
+google-cloud-auth = "1.16.0"
+keyring = "4.2.0"
+reqwest = { version = "0.13.5", default-features = false, features = ["form", "json", "rustls"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sha2 = "0.11.0"
 tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["macros", "rt"] }
-toml = "1.1.4"
+toml = "1.1.6"
 url = "2.5.8"
 webbrowser = "1.2.4"
 zeroize = "1.9.0"
@@ -35,3 +38,6 @@ lto = "thin"
 
 [lints.rust]
 unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = "warn"

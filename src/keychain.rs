@@ -32,14 +32,10 @@ pub fn refresh_token(profile: &ProfileName) -> Result<Option<SecretString>> {
 }
 
 pub fn credential_state(profile: &ProfileName) -> Result<CredentialState> {
-    match entry(profile)?.get_password() {
-        Ok(token) => {
-            let _token = SecretString::new(token);
-            Ok(CredentialState::Present)
-        }
-        Err(keyring::Error::NoEntry) => Ok(CredentialState::Missing),
-        Err(error) => Err(error).context("checking refresh token in OS keychain"),
-    }
+    Ok(match refresh_token(profile)? {
+        Some(_) => CredentialState::Present,
+        None => CredentialState::Missing,
+    })
 }
 
 pub fn delete(profile: &ProfileName) -> Result<()> {

@@ -3,15 +3,14 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
-use oauth2::basic::BasicClient;
-use oauth2::{
-    AuthType, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge,
-    RedirectUrl, Scope, TokenResponse, TokenUrl,
-};
+use anyhow::{Context, Result, bail};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
 use url::Url;
 
+use crate::diagnostics::debug;
 use crate::secret::SecretString;
 
 // gcloud's public installed-application OAuth client. The client secret is
@@ -23,7 +22,7 @@ pub const CLIENT_SECRET: &str = "d-FL95Q19q7MQmFpd7hHD0Ty";
 const AUTH_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 const USERINFO_ENDPOINT: &str = "https://openidconnect.googleapis.com/v1/userinfo";
-const LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const LOGIN_TIMEOUT: Duration = Duration::from_mins(5);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_REQUEST_LINE: u64 = 8 * 1024;
 
@@ -48,25 +47,23 @@ pub struct Login {
 /// Returns API scopes plus the identity scopes required to bind credentials to
 /// the intended Google account.
 pub fn effective_scopes(configured: Option<&[String]>) -> Vec<String> {
-    let mut scopes: Vec<String> = IDENTITY_SCOPES
-        .iter()
-        .map(|scope| (*scope).to_owned())
-        .collect();
-    let api_scopes: Vec<String> = configured.map_or_else(
-        || {
-            DEFAULT_API_SCOPES
-                .iter()
-                .map(|scope| (*scope).to_owned())
-                .collect()
-        },
-        <[String]>::to_vec,
-    );
-    for scope in api_scopes {
-        if !scopes.contains(&scope) {
-            scopes.push(scope);
+    let api_scopes: Vec<&str> = match configured {
+        Some(scopes) => scopes.iter().map(String::as_str).collect(),
+        None => DEFAULT_API_SCOPES.to_vec(),
+    };
+    let mut scopes = Vec::new();
+    for scope in IDENTITY_SCOPES.iter().copied().chain(api_scopes) {
+        if !scopes.iter().any(|existing| existing == scope) {
+            scopes.push(scope.to_owned());
         }
     }
     scopes
+}
+
+fn random_token() -> Result<String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).context("generating random OAuth parameters")?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
 pub async fn login(
@@ -77,24 +74,25 @@ pub async fn login(
     let listener = TcpListener::bind(("127.0.0.1", 0)).context("binding loopback listener")?;
     let redirect_uri = format!("http://127.0.0.1:{}/", listener.local_addr()?.port());
 
-    let client = BasicClient::new(ClientId::new(CLIENT_ID.into()))
-        .set_client_secret(ClientSecret::new(CLIENT_SECRET.into()))
-        .set_auth_uri(AuthUrl::new(AUTH_ENDPOINT.into())?)
-        .set_token_uri(TokenUrl::new(TOKEN_ENDPOINT.into())?)
-        .set_redirect_uri(RedirectUrl::new(redirect_uri)?)
-        .set_auth_type(AuthType::RequestBody);
-
-    let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
-    let mut request = client
-        .authorize_url(CsrfToken::new_random)
-        .add_scopes(scopes.iter().cloned().map(Scope::new))
-        .add_extra_param("access_type", "offline")
-        .add_extra_param("prompt", "consent")
-        .set_pkce_challenge(pkce_challenge);
+    let state = random_token()?;
+    let pkce_verifier = random_token()?;
+    let pkce_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(pkce_verifier.as_bytes()));
+    let scope = scopes.join(" ");
+    let mut params = vec![
+        ("client_id", CLIENT_ID),
+        ("redirect_uri", &redirect_uri),
+        ("response_type", "code"),
+        ("scope", &scope),
+        ("access_type", "offline"),
+        ("prompt", "consent"),
+        ("code_challenge", &pkce_challenge),
+        ("code_challenge_method", "S256"),
+        ("state", &state),
+    ];
     if let Some(hint) = login_hint {
-        request = request.add_extra_param("login_hint", hint);
+        params.push(("login_hint", hint));
     }
-    let (auth_url, csrf_state) = request.url();
+    let auth_url = Url::parse_with_params(AUTH_ENDPOINT, &params)?;
 
     eprintln!("Opening browser for Google sign-in; if nothing happens, open:\n\n  {auth_url}\n");
     if let Some(directory) = chrome_profile {
@@ -104,42 +102,66 @@ pub async fn login(
         crate::chrome::open_default(auth_url.as_str());
     }
 
-    let code = tokio::task::spawn_blocking(move || {
-        wait_for_code(listener, csrf_state.secret(), LOGIN_TIMEOUT)
-    })
-    .await
-    .context("OAuth callback task failed")??;
-    crate::diagnostics::debug(format_args!(
-        "OAuth callback accepted; exchanging authorization code"
-    ));
+    let code = tokio::task::spawn_blocking(move || wait_for_code(&listener, &state, LOGIN_TIMEOUT))
+        .await
+        .context("OAuth callback task failed")??;
+    debug!("OAuth callback accepted; exchanging authorization code");
 
-    let http = oauth2::reqwest::ClientBuilder::new()
-        .redirect(oauth2::reqwest::redirect::Policy::none())
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .build()?;
-    let token = client
-        .exchange_code(AuthorizationCode::new(code))
-        .set_pkce_verifier(pkce_verifier)
-        .request_async(&http)
-        .await
-        .map_err(|error| anyhow!("token exchange failed: {error:?}"))?;
-
+    let token = exchange_code(&http, &code, &redirect_uri, &pkce_verifier).await?;
     let refresh_token = token
-        .refresh_token()
-        .ok_or_else(|| anyhow!("Google returned no refresh token"))?;
-    let identity = fetch_identity(&http, token.access_token().secret()).await?;
-    crate::diagnostics::debug(format_args!(
-        "token exchange and Google identity verification succeeded"
-    ));
+        .refresh_token
+        .context("Google returned no refresh token")?;
+    let identity = fetch_identity(&http, token.access_token.expose()).await?;
+    debug!("token exchange and Google identity verification succeeded");
 
     Ok(Login {
-        refresh_token: SecretString::new(refresh_token.secret()),
+        refresh_token,
         identity,
     })
 }
 
-async fn fetch_identity(http: &oauth2::reqwest::Client, access_token: &str) -> Result<Identity> {
+#[derive(Deserialize)]
+struct TokenResponse {
+    access_token: SecretString,
+    refresh_token: Option<SecretString>,
+}
+
+async fn exchange_code(
+    http: &reqwest::Client,
+    code: &str,
+    redirect_uri: &str,
+    pkce_verifier: &str,
+) -> Result<TokenResponse> {
+    let response = http
+        .post(TOKEN_ENDPOINT)
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("client_id", CLIENT_ID),
+            ("client_secret", CLIENT_SECRET),
+            ("redirect_uri", redirect_uri),
+            ("code_verifier", pkce_verifier),
+        ])
+        .send()
+        .await
+        .context("requesting OAuth tokens")?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        bail!("token exchange failed ({status}): {}", body.trim());
+    }
+    response
+        .json()
+        .await
+        .context("parsing OAuth token response")
+}
+
+async fn fetch_identity(http: &reqwest::Client, access_token: &str) -> Result<Identity> {
     #[derive(Deserialize)]
     struct UserInfo {
         sub: String,
@@ -179,7 +201,11 @@ enum Callback {
     Denied(String),
 }
 
-fn wait_for_code(listener: TcpListener, expected_state: &str, timeout: Duration) -> Result<String> {
+fn wait_for_code(
+    listener: &TcpListener,
+    expected_state: &str,
+    timeout: Duration,
+) -> Result<String> {
     listener
         .set_nonblocking(true)
         .context("configuring OAuth callback listener")?;
@@ -193,7 +219,8 @@ fn wait_for_code(listener: TcpListener, expected_state: &str, timeout: Duration)
             Ok((stream, _)) => match handle_connection(stream, expected_state) {
                 Ok(Callback::Code(code)) => return Ok(code),
                 Ok(Callback::Denied(error)) => bail!("authorization failed: {error}"),
-                Ok(Callback::Continue) | Err(_) => {}
+                Ok(Callback::Continue) => {}
+                Err(error) => debug!("ignoring OAuth callback connection: {error:#}"),
             },
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(10));
@@ -233,12 +260,9 @@ fn handle_connection(mut stream: TcpStream, expected_state: &str) -> Result<Call
         respond(&mut stream, "400 Bad Request", "invalid request");
         return Ok(Callback::Continue);
     };
-    let url = match Url::parse(&format!("http://127.0.0.1{path}")) {
-        Ok(url) => url,
-        Err(_) => {
-            respond(&mut stream, "400 Bad Request", "invalid callback URL");
-            return Ok(Callback::Continue);
-        }
+    let Ok(url) = Url::parse(&format!("http://127.0.0.1{path}")) else {
+        respond(&mut stream, "400 Bad Request", "invalid callback URL");
+        return Ok(Callback::Continue);
     };
 
     let mut code = None;
@@ -337,7 +361,7 @@ mod tests {
     fn accepts_matching_state_and_decodes_the_code() {
         let (listener, port) = listen();
         let handle =
-            thread::spawn(move || wait_for_code(listener, "st4te", Duration::from_secs(1)));
+            thread::spawn(move || wait_for_code(&listener, "st4te", Duration::from_secs(1)));
         assert!(request(port, "/favicon.ico").contains("400"));
         assert!(request(port, "/?code=4%2Fabc&state=st4te").contains("200"));
         assert_eq!(handle.join().unwrap().unwrap(), "4/abc");
@@ -347,7 +371,7 @@ mod tests {
     fn wrong_state_does_not_consume_the_legitimate_flow() {
         let (listener, port) = listen();
         let handle =
-            thread::spawn(move || wait_for_code(listener, "expected", Duration::from_secs(1)));
+            thread::spawn(move || wait_for_code(&listener, "expected", Duration::from_secs(1)));
         assert!(request(port, "/?code=forged&state=wrong").contains("400"));
         assert!(request(port, "/?code=real&state=expected").contains("200"));
         assert_eq!(handle.join().unwrap().unwrap(), "real");
@@ -393,7 +417,7 @@ mod tests {
     fn untrusted_error_cannot_abort_the_flow() {
         let (listener, port) = listen();
         let handle =
-            thread::spawn(move || wait_for_code(listener, "expected", Duration::from_secs(1)));
+            thread::spawn(move || wait_for_code(&listener, "expected", Duration::from_secs(1)));
         assert!(request(port, "/?error=access_denied&state=wrong").contains("400"));
         request(port, "/?code=real&state=expected");
         assert_eq!(handle.join().unwrap().unwrap(), "real");
@@ -402,7 +426,7 @@ mod tests {
     #[test]
     fn surfaces_provider_error_after_state_validation() {
         let (listener, port) = listen();
-        let handle = thread::spawn(move || wait_for_code(listener, "s", Duration::from_secs(1)));
+        let handle = thread::spawn(move || wait_for_code(&listener, "s", Duration::from_secs(1)));
         request(port, "/?error=access_denied&state=s");
         let error = handle.join().unwrap().unwrap_err();
         assert!(error.to_string().contains("access_denied"));
@@ -412,7 +436,7 @@ mod tests {
     fn callback_wait_has_a_deadline() {
         let (listener, _port) = listen();
         let started = Instant::now();
-        let error = wait_for_code(listener, "s", Duration::from_millis(30)).unwrap_err();
+        let error = wait_for_code(&listener, "s", Duration::from_millis(30)).unwrap_err();
         assert!(error.to_string().contains("timed out"));
         assert!(started.elapsed() < Duration::from_secs(1));
     }

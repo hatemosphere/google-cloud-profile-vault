@@ -6,15 +6,12 @@ use crate::auth::{self, Identity};
 use crate::cli::{Cli, Command};
 use crate::config::{ConfigStore, Profile, ProfileName};
 use crate::credentials::{self, AccessToken};
+use crate::diagnostics::debug;
 use crate::keychain::{self, CredentialState};
 use crate::secret::SecretString;
 
 pub async fn run(cli: Cli) -> Result<u8> {
     let store = ConfigStore::discover()?;
-    run_with_store(cli, &store).await
-}
-
-async fn run_with_store(cli: Cli, store: &ConfigStore) -> Result<u8> {
     match cli.command {
         Command::Add {
             name,
@@ -46,18 +43,18 @@ async fn run_with_store(cli: Cli, store: &ConfigStore) -> Result<u8> {
             eprintln!(
                 "Created profile '{name}'. If authentication is interrupted, resume with `gcpv login {name}`."
             );
-            login(&name, store, None).await?;
+            login(&name, &store, None).await?;
             Ok(0)
         }
         Command::Login {
             name,
             browser_profile,
         } => {
-            login(&name, store, browser_profile.as_deref()).await?;
+            login(&name, &store, browser_profile.as_deref()).await?;
             Ok(0)
         }
         Command::List => {
-            list(store)?;
+            list(&store)?;
             Ok(0)
         }
         Command::Remove { name } => {
@@ -65,7 +62,7 @@ async fn run_with_store(cli: Cli, store: &ConfigStore) -> Result<u8> {
                 bail!("no profile '{name}'");
             }
             let previous_token = keychain::refresh_token(&name)?;
-            let remove_result = store.update(|config| {
+            let removed = store.update(|config| {
                 if !config.profiles.contains_key(&name) {
                     bail!("no profile '{name}'");
                 }
@@ -75,83 +72,115 @@ async fn run_with_store(cli: Cli, store: &ConfigStore) -> Result<u8> {
                 config.profiles.remove(&name);
                 Ok(())
             });
-            if let Err(remove_error) = remove_result {
-                let rollback = match previous_token {
-                    Some(previous) => keychain::store_refresh_token(&name, &previous),
-                    None => keychain::delete(&name),
-                };
-                return match rollback {
-                    Ok(()) => Err(remove_error.context("remove failed; restored credential")),
-                    Err(rollback_error) => Err(remove_error.context(format!(
-                        "remove failed and credential rollback also failed: {rollback_error:#}"
-                    ))),
-                };
+            if let Err(error) = removed {
+                return Err(restore_credential(
+                    &name,
+                    previous_token,
+                    error,
+                    "remove failed",
+                ));
             }
             eprintln!("Removed profile '{name}'.");
             Ok(0)
         }
         Command::Exec { name, command } => {
-            let (profile, refresh_token, access_token) = credentials_for(&name, store).await?;
-            let status =
-                crate::process::run(&name, &profile, &command, &refresh_token, &access_token)?;
+            let credentials = credentials_for(&name, &store).await?;
+            let status = crate::process::run(
+                &name,
+                &credentials.profile,
+                &command,
+                &credentials.refresh_token,
+                &credentials.access_token,
+            )?;
             Ok(crate::process::exit_code(status))
         }
         Command::Token { name } => {
-            let (_, _, access_token) = credentials_for(&name, store).await?;
-            println!("{}", access_token.expose());
+            let credentials = credentials_for(&name, &store).await?;
+            println!("{}", credentials.access_token.expose());
             Ok(0)
         }
     }
 }
 
-async fn credentials_for(
+/// Puts the keychain back the way it was before a failed transaction and
+/// folds the rollback outcome into the original error.
+fn restore_credential(
     name: &ProfileName,
-    store: &ConfigStore,
-) -> Result<(Profile, SecretString, AccessToken)> {
+    previous_token: Option<SecretString>,
+    error: anyhow::Error,
+    what_failed: &str,
+) -> anyhow::Error {
+    let rollback = match previous_token {
+        Some(previous) => keychain::store_refresh_token(name, &previous),
+        None => keychain::delete(name),
+    };
+    match rollback {
+        Ok(()) => error.context(format!("{what_failed}; restored previous credential")),
+        Err(rollback_error) => error.context(format!(
+            "{what_failed} and credential rollback also failed: {rollback_error:#}"
+        )),
+    }
+}
+
+struct Credentials {
+    profile: Profile,
+    refresh_token: SecretString,
+    access_token: AccessToken,
+}
+
+async fn credentials_for(name: &ProfileName, store: &ConfigStore) -> Result<Credentials> {
     let interactive = std::io::stderr().is_terminal();
-    let mut profile = load_profile(store, name)?;
-    let mut refresh_token = match keychain::refresh_token(name)? {
-        Some(token) => token,
+    let profile = load_profile(store, name)?;
+    let (profile, refresh_token) = match keychain::refresh_token(name)? {
+        Some(token) => (profile, token),
         None if interactive => {
             eprintln!("No credentials for profile '{name}'; starting login.");
-            login(name, store, None).await?;
-            profile = load_profile(store, name)?;
-            keychain::refresh_token(name)?.context("login did not store a refresh token")?
+            relogin(name, store).await?
         }
         None => bail!("no credentials for profile '{name}'; run `gcpv login {name}`"),
     };
 
-    match mint_access_token(name, &profile, &refresh_token).await {
-        Ok(access_token) => Ok((profile, refresh_token, access_token)),
-        Err(error) if error.credentials_rejected() && interactive => {
-            crate::diagnostics::debug(format_args!(
-                "profile '{name}': stored credential rejected: {error}"
-            ));
-            if error.reauthentication_required() {
-                eprintln!("Google requires profile '{name}' to sign in again; starting login.");
-            } else {
-                eprintln!(
-                    "Stored credentials for profile '{name}' are no longer valid; starting login."
-                );
-            }
-            login(name, store, None).await?;
-            profile = load_profile(store, name)?;
-            refresh_token =
-                keychain::refresh_token(name)?.context("login did not store a refresh token")?;
-            let access_token = mint_access_token(name, &profile, &refresh_token).await?;
-            Ok((profile, refresh_token, access_token))
+    let error = match mint_access_token(name, &profile, &refresh_token).await {
+        Ok(access_token) => {
+            return Ok(Credentials {
+                profile,
+                refresh_token,
+                access_token,
+            });
         }
-        Err(error) if error.credentials_rejected() => {
-            crate::diagnostics::debug(format_args!(
-                "profile '{name}': stored credential rejected: {error}"
-            ));
-            if error.reauthentication_required() {
-                bail!("Google sign-in required for profile '{name}'; run `gcpv login {name}`");
-            }
-            bail!("credentials expired or were revoked; run `gcpv login {name}`");
+        Err(error) if error.credentials_rejected() => error,
+        Err(error) => return Err(error.into()),
+    };
+
+    debug!("profile '{name}': stored credential rejected: {error}");
+    let reauthentication = error.reauthentication_required();
+    if !interactive {
+        if reauthentication {
+            bail!("Google sign-in required for profile '{name}'; run `gcpv login {name}`");
         }
-        Err(error) => Err(error.into()),
+        bail!("credentials expired or were revoked; run `gcpv login {name}`");
     }
+    if reauthentication {
+        eprintln!("Google requires profile '{name}' to sign in again; starting login.");
+    } else {
+        eprintln!("Stored credentials for profile '{name}' are no longer valid; starting login.");
+    }
+    let (profile, refresh_token) = relogin(name, store).await?;
+    let access_token = mint_access_token(name, &profile, &refresh_token).await?;
+    Ok(Credentials {
+        profile,
+        refresh_token,
+        access_token,
+    })
+}
+
+/// Runs an interactive login and re-reads what it stored.
+async fn relogin(name: &ProfileName, store: &ConfigStore) -> Result<(Profile, SecretString)> {
+    login(name, store, None).await?;
+    let profile = load_profile(store, name)?;
+    let refresh_token =
+        keychain::refresh_token(name)?.context("login did not store a refresh token")?;
+    Ok((profile, refresh_token))
 }
 
 async fn mint_access_token(
@@ -164,9 +193,7 @@ async fn mint_access_token(
     } else {
         "user-account"
     };
-    crate::diagnostics::debug(format_args!(
-        "profile '{name}': minting {kind} access token"
-    ));
+    debug!("profile '{name}': minting {kind} access token");
     credentials::mint(profile, refresh_token).await
 }
 
@@ -206,19 +233,13 @@ async fn login(
         }
         Ok(())
     });
-    if let Err(save_error) = save_result {
-        let rollback = match previous_token {
-            Some(previous) => keychain::store_refresh_token(name, &previous),
-            None => keychain::delete(name),
-        };
-        return match rollback {
-            Ok(()) => {
-                Err(save_error.context("profile update failed; restored previous credential"))
-            }
-            Err(rollback_error) => Err(save_error.context(format!(
-                "profile update failed and credential rollback also failed: {rollback_error:#}"
-            ))),
-        };
+    if let Err(error) = save_result {
+        return Err(restore_credential(
+            name,
+            previous_token,
+            error,
+            "profile update failed",
+        ));
     }
 
     eprintln!(

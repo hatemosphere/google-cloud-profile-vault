@@ -22,9 +22,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
         shell: bash
-        run: |
-          rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
-          rustup default 1.97.1
+        run: rustup toolchain install
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint

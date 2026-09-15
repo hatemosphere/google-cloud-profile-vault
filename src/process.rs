@@ -1,9 +1,8 @@
 use std::io::Write as _;
 use std::path::Path;
-use std::process::{Command, ExitStatus};
+use std::process::{Child, Command, ExitStatus};
+#[cfg(windows)]
 use std::sync::OnceLock;
-#[cfg(unix)]
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 
@@ -39,27 +38,23 @@ pub fn run(
     refresh_token: &SecretString,
     access_token: &AccessToken,
 ) -> Result<ExitStatus> {
-    let signals = install_signal_handlers()?;
     let adc_file = temporary_adc(profile, refresh_token)?;
 
     let (program, arguments) = match command {
         [] => (default_shell(), &[] as &[String]),
         [program, arguments @ ..] => (program.clone(), arguments),
     };
-    let mut command = child_command(
+    let mut child = child_command(
         &program,
         arguments,
         name,
         profile,
         adc_file.path(),
         access_token,
-    );
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("running {program}"))?;
-    let status = wait_for_child(&mut child, &signals)?;
-    drop(adc_file);
-    Ok(status)
+    )
+    .spawn()
+    .with_context(|| format!("running {program}"))?;
+    wait_for_child(&mut child)
 }
 
 fn temporary_adc(
@@ -77,60 +72,66 @@ fn temporary_adc(
     Ok(file)
 }
 
+/// Keeps gcpv alive through terminal signals so the ADC file is always
+/// deleted, and relays signals addressed only to gcpv.
+///
+/// Terminal-generated SIGINT/SIGQUIT already reach the child through the
+/// foreground process group; forwarding them would deliver a second interrupt,
+/// which tools like Terraform treat as "exit immediately".
 #[cfg(unix)]
-#[derive(Clone)]
-struct SignalState {
-    interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    terminate: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    hangup: std::sync::Arc<std::sync::atomic::AtomicBool>,
-}
+fn wait_for_child(child: &mut Child) -> Result<ExitStatus> {
+    use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process, waitid};
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 
-#[cfg(unix)]
-impl SignalState {
-    fn clear(&self) {
-        use std::sync::atomic::Ordering;
-        self.interrupt.store(false, Ordering::Relaxed);
-        self.terminate.store(false, Ordering::Relaxed);
-        self.hangup.store(false, Ordering::Relaxed);
-    }
-
-    fn take(&self) -> Option<rustix::process::Signal> {
-        use std::sync::atomic::Ordering;
-        if self.interrupt.swap(false, Ordering::Relaxed) {
-            return Some(rustix::process::Signal::INT);
-        }
-        if self.terminate.swap(false, Ordering::Relaxed) {
-            return Some(rustix::process::Signal::TERM);
-        }
-        if self.hangup.swap(false, Ordering::Relaxed) {
-            return Some(rustix::process::Signal::HUP);
-        }
-        None
-    }
-}
-
-#[cfg(not(unix))]
-struct SignalState;
-
-#[cfg(unix)]
-fn wait_for_child(child: &mut std::process::Child, signals: &SignalState) -> Result<ExitStatus> {
-    let pid = rustix::process::Pid::from_raw(child.id() as i32)
+    let pid = Pid::from_raw(child.id().cast_signed())
         .context("child process ID was outside the supported range")?;
+    let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGQUIT, SIGTERM, SIGHUP])
+        .context("installing signal handlers")?;
+    let handle = signals.handle();
+    let forwarder = std::thread::spawn(move || {
+        for signal in signals.forever() {
+            let relayed = match signal {
+                SIGTERM => Signal::TERM,
+                SIGHUP => Signal::HUP,
+                _ => continue,
+            };
+            let _ = kill_process(pid, relayed);
+        }
+    });
+
+    // Wait without reaping so the pid cannot be reused while the forwarder
+    // may still signal it.
     loop {
-        if let Some(status) = child.try_wait().context("waiting for child process")? {
-            return Ok(status);
+        match waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
+        ) {
+            Ok(_) => break,
+            Err(rustix::io::Errno::INTR) => {}
+            Err(error) => return Err(error).context("waiting for child process"),
         }
-        while let Some(signal) = signals.take() {
-            // Terminal-generated signals already reach the child process. This
-            // also covers signals sent only to the gcpv parent.
-            let _ = rustix::process::kill_process(pid, signal);
-        }
-        std::thread::sleep(Duration::from_millis(10));
     }
+    handle.close();
+    forwarder
+        .join()
+        .map_err(|_| anyhow!("signal forwarding thread panicked"))?;
+    child.wait().context("waiting for child process")
 }
 
-#[cfg(not(unix))]
-fn wait_for_child(child: &mut std::process::Child, _signals: &SignalState) -> Result<ExitStatus> {
+#[cfg(windows)]
+fn wait_for_child(child: &mut Child) -> Result<ExitStatus> {
+    // The console delivers Ctrl-C to the child directly; gcpv only has to
+    // survive it long enough to delete the ADC file.
+    static HANDLER: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    HANDLER
+        .get_or_init(|| ctrlc::set_handler(|| {}).map_err(|error| error.to_string()))
+        .clone()
+        .map_err(|error| anyhow!("installing Ctrl-C handler: {error}"))?;
+    child.wait().context("waiting for child process")
+}
+
+#[cfg(not(any(unix, windows)))]
+fn wait_for_child(child: &mut Child) -> Result<ExitStatus> {
     child.wait().context("waiting for child process")
 }
 
@@ -194,51 +195,6 @@ fn default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
 }
 
-#[cfg(unix)]
-fn install_signal_handlers() -> Result<SignalState> {
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
-
-    static INSTALLATION: OnceLock<std::result::Result<SignalState, String>> = OnceLock::new();
-    let already_installed = INSTALLATION.get().is_some();
-    let state = INSTALLATION
-        .get_or_init(|| {
-            let state = SignalState {
-                interrupt: Arc::new(AtomicBool::new(false)),
-                terminate: Arc::new(AtomicBool::new(false)),
-                hangup: Arc::new(AtomicBool::new(false)),
-            };
-            signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&state.interrupt))
-                .map_err(|error| error.to_string())?;
-            signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&state.terminate))
-                .map_err(|error| error.to_string())?;
-            signal_hook::flag::register(signal_hook::consts::SIGHUP, Arc::clone(&state.hangup))
-                .map_err(|error| error.to_string())?;
-            Ok(state)
-        })
-        .clone()
-        .map_err(|error| anyhow!("installing signal handlers: {error}"))?;
-    if already_installed {
-        state.clear();
-    }
-    Ok(state)
-}
-
-#[cfg(windows)]
-fn install_signal_handlers() -> Result<SignalState> {
-    static INSTALLATION: OnceLock<std::result::Result<(), String>> = OnceLock::new();
-    INSTALLATION
-        .get_or_init(|| ctrlc::set_handler(|| {}).map_err(|error| error.to_string()))
-        .clone()
-        .map_err(|error| anyhow!("installing Ctrl-C handler: {error}"))?;
-    Ok(SignalState)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn install_signal_handlers() -> Result<SignalState> {
-    Ok(SignalState)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,6 +225,17 @@ mod tests {
     #[cfg(unix)]
     fn shell(script: String) -> Vec<String> {
         vec!["sh".into(), "-c".into(), script]
+    }
+
+    /// Signals sent to the test process are relayed by every concurrent
+    /// `run`, so tests that spawn children must not overlap.
+    #[cfg(unix)]
+    fn run_serialized(command: &[String], profile: &Profile) -> Result<ExitStatus> {
+        static RUN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = RUN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        run(&name(), profile, command, &refresh_token(), &access_token())
     }
 
     fn configured_environment(command: &Command) -> BTreeMap<OsString, Option<OsString>> {
@@ -330,9 +297,7 @@ mod tests {
              cat \"$GOOGLE_APPLICATION_CREDENTIALS\" >> {out}",
             out = output.display()
         );
-        let refresh = refresh_token();
-        let access = access_token();
-        let status = run(&name(), &profile(), &shell(script), &refresh, &access).unwrap();
+        let status = run_serialized(&shell(script), &profile()).unwrap();
         assert!(status.success());
 
         let data = std::fs::read_to_string(&output).unwrap();
@@ -361,17 +326,24 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn run_returns_the_child_exit_status() {
-        let refresh = refresh_token();
-        let access = access_token();
-        let status = run(
-            &name(),
-            &profile(),
-            &shell("exit 42".into()),
-            &refresh,
-            &access,
-        )
-        .unwrap();
+        let status = run_serialized(&shell("exit 42".into()), &profile()).unwrap();
         assert_eq!(exit_code(status), 42);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relays_term_but_not_int_addressed_to_gcpv() {
+        let output_directory = tempfile::tempdir().unwrap();
+        let output = output_directory.path().join("signals");
+        let script = format!(
+            "int=0; term=0; trap 'int=$((int+1))' INT; trap 'term=$((term+1))' TERM; \
+             kill -INT $PPID; kill -TERM $PPID; sleep 0.3; sleep 0.3; \
+             echo \"$int $term\" > {}",
+            output.display()
+        );
+        let status = run_serialized(&shell(script), &profile()).unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read_to_string(&output).unwrap().trim(), "0 1");
     }
 
     #[cfg(unix)]
@@ -383,9 +355,7 @@ mod tests {
             "echo \"$GOOGLE_APPLICATION_CREDENTIALS\" > {}; kill -TERM $$",
             output.display()
         );
-        let refresh = refresh_token();
-        let access = access_token();
-        let status = run(&name(), &profile(), &shell(script), &refresh, &access).unwrap();
+        let status = run_serialized(&shell(script), &profile()).unwrap();
         assert_eq!(exit_code(status), 128 + 15);
         let adc_path = std::fs::read_to_string(&output).unwrap();
         assert!(!Path::new(adc_path.trim()).exists());

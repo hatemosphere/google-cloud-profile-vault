@@ -1,5 +1,6 @@
 use std::fmt;
 
+use serde::{Deserialize, Deserializer};
 use zeroize::Zeroize;
 
 /// An owned secret that is redacted from debug output and zeroized on drop.
@@ -18,6 +19,12 @@ impl SecretString {
 impl fmt::Debug for SecretString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("[REDACTED]")
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretString {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Self)
     }
 }
 

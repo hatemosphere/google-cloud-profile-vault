@@ -5,6 +5,8 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
+use crate::diagnostics::debug;
+
 #[derive(Deserialize)]
 struct LocalState {
     profile: ProfileState,
@@ -60,35 +62,24 @@ fn select_profile_using(
     account: Option<&str>,
     resolve: impl Fn(&str) -> Result<String>,
 ) -> Result<Option<String>> {
-    match explicit {
-        Some(specifier) => resolve(specifier).map(|directory| {
-            crate::diagnostics::debug(format_args!(
-                "using explicitly configured Chrome profile '{directory}'"
-            ));
-            Some(directory)
-        }),
-        None => match account {
-            Some(email) => match resolve(email) {
-                Ok(directory) => {
-                    crate::diagnostics::debug(format_args!(
-                        "matched account to Chrome profile '{directory}'"
-                    ));
-                    Ok(Some(directory))
-                }
-                Err(error) => {
-                    crate::diagnostics::debug(format_args!(
-                        "Chrome profile auto-match failed ({error:#}); using the system browser"
-                    ));
-                    Ok(None)
-                }
-            },
-            None => {
-                crate::diagnostics::debug(format_args!(
-                    "no account or Chrome profile configured; using the system browser"
-                ));
-                Ok(None)
-            }
-        },
+    if let Some(specifier) = explicit {
+        let directory = resolve(specifier)?;
+        debug!("using explicitly configured Chrome profile '{directory}'");
+        return Ok(Some(directory));
+    }
+    let Some(email) = account else {
+        debug!("no account or Chrome profile configured; using the system browser");
+        return Ok(None);
+    };
+    match resolve(email) {
+        Ok(directory) => {
+            debug!("matched account to Chrome profile '{directory}'");
+            Ok(Some(directory))
+        }
+        Err(error) => {
+            debug!("Chrome profile auto-match failed ({error:#}); using the system browser");
+            Ok(None)
+        }
     }
 }
 

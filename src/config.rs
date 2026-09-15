@@ -1,7 +1,5 @@
 use std::collections::BTreeMap;
 use std::fmt;
-#[cfg(unix)]
-use std::fs::File;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -22,7 +20,7 @@ impl ProfileName {
 
 impl fmt::Display for ProfileName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.pad(&self.0)
     }
 }
 
@@ -78,10 +76,11 @@ impl Config {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_field_names)] // `browser_profile` is a config file key
 pub struct Profile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
-    /// Stable OpenID Connect subject for the Google account.
+    /// Stable `OpenID` Connect subject for the Google account.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -170,10 +169,12 @@ pub struct ConfigStore {
 
 impl ConfigStore {
     pub fn discover() -> Result<Self> {
-        let home = std::env::home_dir().context("cannot determine home directory")?;
-        Ok(Self::new(
-            home.join(".config").join("gcpv").join("config.toml"),
-        ))
+        let config = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| std::env::home_dir().map(|home| home.join(".config")))
+            .context("cannot determine configuration directory")?;
+        Ok(Self::new(config.join("gcpv").join("config.toml")))
     }
 
     pub fn new(path: PathBuf) -> Self {
@@ -246,7 +247,7 @@ fn save_atomic(path: &Path, config: &Config) -> Result<()> {
         .with_context(|| format!("replacing {}", path.display()))?;
 
     #[cfg(unix)]
-    File::open(parent)
+    fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
         .with_context(|| format!("syncing {}", parent.display()))?;
     Ok(())

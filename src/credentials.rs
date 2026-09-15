@@ -8,7 +8,7 @@ use crate::config::Profile;
 use crate::secret::SecretString;
 
 #[derive(Serialize)]
-pub(crate) struct AuthorizedUserAdc<'a> {
+pub struct AuthorizedUserAdc<'a> {
     #[serde(rename = "type")]
     kind: &'static str,
     client_id: &'static str,
@@ -19,7 +19,7 @@ pub(crate) struct AuthorizedUserAdc<'a> {
 }
 
 #[derive(Serialize)]
-pub(crate) struct ImpersonatedAdc<'a> {
+pub struct ImpersonatedAdc<'a> {
     #[serde(rename = "type")]
     kind: &'static str,
     service_account_impersonation_url: String,
@@ -31,22 +31,24 @@ pub(crate) struct ImpersonatedAdc<'a> {
 
 #[derive(Serialize)]
 #[serde(untagged)]
-pub(crate) enum Adc<'a> {
+pub enum Adc<'a> {
     AuthorizedUser(AuthorizedUserAdc<'a>),
     Impersonated(ImpersonatedAdc<'a>),
 }
 
-pub(crate) fn adc<'a>(profile: &'a Profile, refresh_token: &'a SecretString) -> Adc<'a> {
+pub fn adc<'a>(profile: &'a Profile, refresh_token: &'a SecretString) -> Adc<'a> {
+    // With impersonation the quota project belongs on the outer credential.
+    let source_quota_project = if profile.impersonate_service_account.is_none() {
+        profile.quota_project()
+    } else {
+        None
+    };
     let source = AuthorizedUserAdc {
         kind: "authorized_user",
         client_id: auth::CLIENT_ID,
         client_secret: auth::CLIENT_SECRET,
         refresh_token: refresh_token.expose(),
-        quota_project_id: profile
-            .impersonate_service_account
-            .is_none()
-            .then(|| profile.quota_project())
-            .flatten(),
+        quota_project_id: source_quota_project,
     };
 
     match &profile.impersonate_service_account {
@@ -66,7 +68,7 @@ pub(crate) fn adc<'a>(profile: &'a Profile, refresh_token: &'a SecretString) -> 
 pub struct AccessToken(SecretString);
 
 impl AccessToken {
-    pub(crate) fn new(value: impl Into<String>) -> Self {
+    pub fn new(value: impl Into<String>) -> Self {
         Self(SecretString::new(value))
     }
 
@@ -131,8 +133,7 @@ impl MintError {
                 "{context}: {}",
                 rejection
                     .as_ref()
-                    .map(|(message, _)| message.as_str())
-                    .unwrap_or(&details)
+                    .map_or(details.as_str(), |(message, _)| message.as_str())
             ),
             rejection: rejection.map(|(_, reason)| reason),
         }
