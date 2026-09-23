@@ -133,6 +133,7 @@ remains configured; continue with `gcpv login NAME`.
 | Variable | Value |
 |---|---|
 | `GOOGLE_APPLICATION_CREDENTIALS` | Temporary authorized-user or impersonated ADC file |
+| `BOTO_CONFIG` | Temporary boto file for gsutil |
 | `CLOUDSDK_AUTH_ACCESS_TOKEN` | Fresh token for the gcloud CLI |
 | `CLOUDSDK_CORE_ACCOUNT` | Authenticated user email |
 | `CLOUDSDK_CORE_PROJECT` | Profile project |
@@ -143,6 +144,11 @@ remains configured; continue with `gcpv login NAME`.
 Competing Google credential, access-token, project, and impersonation variables
 are removed before this environment is applied. `CLOUDSDK_CONFIG` is preserved,
 so `gcloud config set` still writes to the user's normal gcloud configuration.
+
+gsutil ignores ADC and the access-token variable and reads credentials only
+from boto files, like the one `gcloud auth login` writes per account. The boto
+file carries the same refresh token and impersonation target. `BOTO_PATH` is
+removed so an existing `~/.boto` cannot supply competing credentials.
 
 `GOOGLE_OAUTH_ACCESS_TOKEN` is intentionally removed instead of populated.
 Terraform gives that static token precedence over ADC and cannot renew it;
@@ -253,10 +259,11 @@ controls][refresh-expiration].
 - Login uses authorization code flow with PKCE, a CSRF state value, a loopback
   callback bound to `127.0.0.1`, verified Google identity data, connection
   limits, and an overall callback deadline.
-- During `exec`, an ADC file with restrictive permissions (`0600` on Unix)
-  contains the refresh token so ADC clients can renew access tokens. The child
-  process can read and copy that long-lived token; only run trusted commands.
-- The ADC file is deleted after normal child termination and after handled
+- During `exec`, an ADC file and a boto file with restrictive permissions
+  (`0600` on Unix) contain the refresh token so ADC clients and gsutil can
+  renew access tokens. The child process can read and copy that long-lived
+  token; only run trusted commands.
+- Both files are deleted after normal child termination and after handled
   `SIGINT`, `SIGQUIT`, `SIGTERM`, or `SIGHUP`. Terminal-generated `SIGINT` and
   `SIGQUIT` already reach the child through the process group and are not
   relayed a second time; `SIGTERM` and `SIGHUP` sent only to gcpv are relayed

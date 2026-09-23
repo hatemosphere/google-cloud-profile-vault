@@ -65,6 +65,29 @@ pub fn adc<'a>(profile: &'a Profile, refresh_token: &'a SecretString) -> Adc<'a>
     }
 }
 
+/// Boto configuration for gsutil, which ignores ADC and access-token
+/// variables and only reads credentials from boto files. Mirrors the
+/// per-account file `gcloud auth login` writes under `legacy_credentials`.
+pub fn boto(profile: &Profile, refresh_token: &SecretString) -> SecretString {
+    let mut config = format!(
+        "[OAuth2]\nclient_id = {}\nclient_secret = {}\n\n[Credentials]\ngs_oauth2_refresh_token = {}\n",
+        auth::CLIENT_ID,
+        auth::CLIENT_SECRET,
+        refresh_token.expose(),
+    );
+    if let Some(service_account) = &profile.impersonate_service_account {
+        config.push_str("gs_impersonate_service_account = ");
+        config.push_str(service_account);
+        config.push('\n');
+    }
+    if let Some(project) = &profile.project {
+        config.push_str("\n[GSUtil]\ndefault_project_id = ");
+        config.push_str(project);
+        config.push('\n');
+    }
+    SecretString::new(config)
+}
+
 pub struct AccessToken(SecretString);
 
 impl AccessToken {
@@ -251,6 +274,23 @@ mod tests {
             value["service_account_impersonation_url"],
             "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/deploy@project-a.iam.gserviceaccount.com:generateAccessToken"
         );
+    }
+
+    #[test]
+    fn boto_carries_refresh_token_impersonation_and_project() {
+        let mut profile = profile();
+        profile.impersonate_service_account =
+            Some("deploy@project-a.iam.gserviceaccount.com".into());
+        let refresh = SecretString::new("refresh-token");
+        let boto = boto(&profile, &refresh);
+        let boto = boto.expose();
+
+        assert!(boto.contains(&format!("client_id = {}\n", auth::CLIENT_ID)));
+        assert!(boto.contains("gs_oauth2_refresh_token = refresh-token\n"));
+        assert!(boto.contains(
+            "gs_impersonate_service_account = deploy@project-a.iam.gserviceaccount.com\n"
+        ));
+        assert!(boto.contains("[GSUtil]\ndefault_project_id = project-a\n"));
     }
 
     #[derive(Debug)]

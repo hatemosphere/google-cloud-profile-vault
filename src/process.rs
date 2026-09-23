@@ -11,6 +11,8 @@ use crate::credentials::{self, AccessToken};
 use crate::secret::SecretString;
 
 const CLEAN_ENVIRONMENT: &[&str] = &[
+    "BOTO_CONFIG",
+    "BOTO_PATH",
     "GOOGLE_APPLICATION_CREDENTIALS",
     "GOOGLE_BACKEND_CREDENTIALS",
     "GOOGLE_CREDENTIALS",
@@ -39,6 +41,7 @@ pub fn run(
     access_token: &AccessToken,
 ) -> Result<ExitStatus> {
     let adc_file = temporary_adc(profile, refresh_token)?;
+    let boto_file = temporary_boto(profile, refresh_token)?;
 
     let (program, arguments) = match command {
         [] => (default_shell(), &[] as &[String]),
@@ -50,6 +53,7 @@ pub fn run(
         name,
         profile,
         adc_file.path(),
+        boto_file.path(),
         access_token,
     )
     .spawn()
@@ -57,18 +61,38 @@ pub fn run(
     wait_for_child(&mut child)
 }
 
+/// Owner-only (0600 on Unix) file deleted when dropped.
+fn private_temporary_file(prefix: &str, suffix: &str) -> Result<tempfile::NamedTempFile> {
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .suffix(suffix)
+        .tempfile()
+        .with_context(|| format!("creating temporary {prefix}{suffix} file"))
+}
+
 fn temporary_adc(
     profile: &Profile,
     refresh_token: &SecretString,
 ) -> Result<tempfile::NamedTempFile> {
-    let mut file = tempfile::Builder::new()
-        .prefix("gcpv-adc-")
-        .suffix(".json")
-        .tempfile()
-        .context("creating temporary ADC file")?;
+    let mut file = private_temporary_file("gcpv-adc-", ".json")?;
     serde_json::to_writer_pretty(&mut file, &credentials::adc(profile, refresh_token))
         .context("writing temporary ADC file")?;
     file.flush().context("flushing temporary ADC file")?;
+    Ok(file)
+}
+
+fn temporary_boto(
+    profile: &Profile,
+    refresh_token: &SecretString,
+) -> Result<tempfile::NamedTempFile> {
+    let mut file = private_temporary_file("gcpv-boto-", ".cfg")?;
+    file.write_all(
+        credentials::boto(profile, refresh_token)
+            .expose()
+            .as_bytes(),
+    )
+    .context("writing temporary boto file")?;
+    file.flush().context("flushing temporary boto file")?;
     Ok(file)
 }
 
@@ -141,6 +165,7 @@ fn child_command(
     name: &ProfileName,
     profile: &Profile,
     adc_path: &Path,
+    boto_path: &Path,
     access_token: &AccessToken,
 ) -> Command {
     let mut command = Command::new(program);
@@ -151,6 +176,7 @@ fn child_command(
     command
         .env("GCPV_PROFILE", name.as_str())
         .env("GOOGLE_APPLICATION_CREDENTIALS", adc_path)
+        .env("BOTO_CONFIG", boto_path)
         .env("CLOUDSDK_AUTH_ACCESS_TOKEN", access_token.expose());
 
     if let Some(account) = &profile.account {
@@ -258,11 +284,13 @@ mod tests {
             &name(),
             &profile,
             Path::new("/tmp/adc.json"),
+            Path::new("/tmp/boto.cfg"),
             &access,
         );
         let environment = configured_environment(&command);
 
         for variable in [
+            "BOTO_PATH",
             "GOOGLE_CREDENTIALS",
             "GOOGLE_BACKEND_CREDENTIALS",
             "GOOGLE_CLOUD_KEYFILE_JSON",
@@ -288,13 +316,14 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn run_injects_env_writes_private_adc_and_deletes_it_afterward() {
+    fn run_injects_env_writes_private_credential_files_and_deletes_them_afterward() {
         let output_directory = tempfile::tempdir().unwrap();
         let output = output_directory.path().join("environment.txt");
         let script = format!(
             "echo \"$GOOGLE_APPLICATION_CREDENTIALS\" > {out}; \
+             echo \"$BOTO_CONFIG\" >> {out}; \
              echo \"$CLOUDSDK_AUTH_ACCESS_TOKEN|${{GOOGLE_OAUTH_ACCESS_TOKEN-unset}}|$GCPV_PROFILE|$CLOUDSDK_CORE_PROJECT|$GOOGLE_CLOUD_QUOTA_PROJECT|$CLOUDSDK_CORE_ACCOUNT\" >> {out}; \
-             cat \"$GOOGLE_APPLICATION_CREDENTIALS\" >> {out}",
+             cat \"$GOOGLE_APPLICATION_CREDENTIALS\" \"$BOTO_CONFIG\" >> {out}",
             out = output.display()
         );
         let status = run_serialized(&shell(script), &profile()).unwrap();
@@ -305,22 +334,30 @@ mod tests {
         let adc_path = lines.next().unwrap();
         assert!(adc_path.contains("gcpv-adc-"));
         assert!(!Path::new(adc_path).exists());
+        let boto_path = lines.next().unwrap();
+        assert!(boto_path.contains("gcpv-boto-"));
+        assert!(!Path::new(boto_path).exists());
         assert_eq!(
             lines.next().unwrap(),
             "access-token|unset|test-profile|project-a|project-a|test@example.com"
         );
         assert!(data.contains("\"refresh_token\": \"refresh-token\""));
+        assert!(data.contains("gs_oauth2_refresh_token = refresh-token"));
     }
 
     #[test]
     #[cfg(unix)]
-    fn temporary_adc_has_owner_only_permissions() {
+    fn temporary_credential_files_have_owner_only_permissions() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let refresh = refresh_token();
-        let file = temporary_adc(&profile(), &refresh).unwrap();
-        let mode = file.as_file().metadata().unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        for file in [
+            temporary_adc(&profile(), &refresh).unwrap(),
+            temporary_boto(&profile(), &refresh).unwrap(),
+        ] {
+            let mode = file.as_file().metadata().unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 
     #[test]
