@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result, anyhow};
 
 use crate::config::{Profile, ProfileName};
-use crate::credentials::{self, AccessToken};
+use crate::credentials;
 use crate::secret::SecretString;
 
 const CLEAN_ENVIRONMENT: &[&str] = &[
@@ -38,10 +38,22 @@ pub fn run(
     profile: &Profile,
     command: &[String],
     refresh_token: &SecretString,
-    access_token: &AccessToken,
 ) -> Result<ExitStatus> {
-    let adc_file = temporary_adc(profile, refresh_token)?;
+    let adc_file = temporary_json("gcpv-adc-", &credentials::adc(profile, refresh_token))?;
     let boto_file = temporary_boto(profile, refresh_token)?;
+    // gcloud's credential file override rejects impersonated ADC, so an
+    // impersonated profile gives gcloud the source user credential and lets
+    // gcloud impersonate via CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT.
+    let gcloud_file = match profile.impersonate_service_account {
+        Some(_) => Some(temporary_json(
+            "gcpv-gcloud-",
+            &credentials::authorized_user(refresh_token, None),
+        )?),
+        None => None,
+    };
+    let gcloud_path = gcloud_file
+        .as_ref()
+        .map_or(adc_file.path(), tempfile::NamedTempFile::path);
 
     let (program, arguments) = match command {
         [] => (default_shell(), &[] as &[String]),
@@ -54,7 +66,7 @@ pub fn run(
         profile,
         adc_file.path(),
         boto_file.path(),
-        access_token,
+        gcloud_path,
     )
     .spawn()
     .with_context(|| format!("running {program}"))?;
@@ -70,14 +82,12 @@ fn private_temporary_file(prefix: &str, suffix: &str) -> Result<tempfile::NamedT
         .with_context(|| format!("creating temporary {prefix}{suffix} file"))
 }
 
-fn temporary_adc(
-    profile: &Profile,
-    refresh_token: &SecretString,
-) -> Result<tempfile::NamedTempFile> {
-    let mut file = private_temporary_file("gcpv-adc-", ".json")?;
-    serde_json::to_writer_pretty(&mut file, &credentials::adc(profile, refresh_token))
-        .context("writing temporary ADC file")?;
-    file.flush().context("flushing temporary ADC file")?;
+fn temporary_json(prefix: &str, value: &impl serde::Serialize) -> Result<tempfile::NamedTempFile> {
+    let mut file = private_temporary_file(prefix, ".json")?;
+    serde_json::to_writer_pretty(&mut file, value)
+        .with_context(|| format!("writing temporary {prefix} file"))?;
+    file.flush()
+        .with_context(|| format!("flushing temporary {prefix} file"))?;
     Ok(file)
 }
 
@@ -166,7 +176,7 @@ fn child_command(
     profile: &Profile,
     adc_path: &Path,
     boto_path: &Path,
-    access_token: &AccessToken,
+    gcloud_credential_path: &Path,
 ) -> Command {
     let mut command = Command::new(program);
     command.args(arguments);
@@ -177,7 +187,13 @@ fn child_command(
         .env("GCPV_PROFILE", name.as_str())
         .env("GOOGLE_APPLICATION_CREDENTIALS", adc_path)
         .env("BOTO_CONFIG", boto_path)
-        .env("CLOUDSDK_AUTH_ACCESS_TOKEN", access_token.expose());
+        .env(
+            "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+            gcloud_credential_path,
+        );
+    if let Some(service_account) = &profile.impersonate_service_account {
+        command.env("CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT", service_account);
+    }
 
     if let Some(account) = &profile.account {
         command.env("CLOUDSDK_CORE_ACCOUNT", account);
@@ -244,10 +260,6 @@ mod tests {
         SecretString::new("refresh-token")
     }
 
-    fn access_token() -> AccessToken {
-        AccessToken::new("access-token")
-    }
-
     #[cfg(unix)]
     fn shell(script: String) -> Vec<String> {
         vec!["sh".into(), "-c".into(), script]
@@ -261,7 +273,7 @@ mod tests {
         let _guard = RUN_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        run(&name(), profile, command, &refresh_token(), &access_token())
+        run(&name(), profile, command, &refresh_token())
     }
 
     fn configured_environment(command: &Command) -> BTreeMap<OsString, Option<OsString>> {
@@ -277,7 +289,6 @@ mod tests {
         profile.account = None;
         profile.project = None;
         profile.quota_project = None;
-        let access = access_token();
         let command = child_command(
             "program",
             &[],
@@ -285,12 +296,13 @@ mod tests {
             &profile,
             Path::new("/tmp/adc.json"),
             Path::new("/tmp/boto.cfg"),
-            &access,
+            Path::new("/tmp/gcloud.json"),
         );
         let environment = configured_environment(&command);
 
         for variable in [
             "BOTO_PATH",
+            "CLOUDSDK_AUTH_ACCESS_TOKEN",
             "GOOGLE_CREDENTIALS",
             "GOOGLE_BACKEND_CREDENTIALS",
             "GOOGLE_CLOUD_KEYFILE_JSON",
@@ -309,8 +321,8 @@ mod tests {
             );
         }
         assert_eq!(
-            environment[OsStr::new("CLOUDSDK_AUTH_ACCESS_TOKEN")].as_deref(),
-            Some(OsStr::new("access-token"))
+            environment[OsStr::new("CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE")].as_deref(),
+            Some(OsStr::new("/tmp/gcloud.json"))
         );
     }
 
@@ -322,7 +334,7 @@ mod tests {
         let script = format!(
             "echo \"$GOOGLE_APPLICATION_CREDENTIALS\" > {out}; \
              echo \"$BOTO_CONFIG\" >> {out}; \
-             echo \"$CLOUDSDK_AUTH_ACCESS_TOKEN|${{GOOGLE_OAUTH_ACCESS_TOKEN-unset}}|$GCPV_PROFILE|$CLOUDSDK_CORE_PROJECT|$GOOGLE_CLOUD_QUOTA_PROJECT|$CLOUDSDK_CORE_ACCOUNT\" >> {out}; \
+             echo \"${{CLOUDSDK_AUTH_ACCESS_TOKEN-unset}}|$CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE|${{GOOGLE_OAUTH_ACCESS_TOKEN-unset}}|$GCPV_PROFILE|$CLOUDSDK_CORE_PROJECT|$GOOGLE_CLOUD_QUOTA_PROJECT|$CLOUDSDK_CORE_ACCOUNT\" >> {out}; \
              cat \"$GOOGLE_APPLICATION_CREDENTIALS\" \"$BOTO_CONFIG\" >> {out}",
             out = output.display()
         );
@@ -339,10 +351,35 @@ mod tests {
         assert!(!Path::new(boto_path).exists());
         assert_eq!(
             lines.next().unwrap(),
-            "access-token|unset|test-profile|project-a|project-a|test@example.com"
+            format!("unset|{adc_path}|unset|test-profile|project-a|project-a|test@example.com")
         );
         assert!(data.contains("\"refresh_token\": \"refresh-token\""));
         assert!(data.contains("gs_oauth2_refresh_token = refresh-token"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn impersonated_profile_gives_gcloud_the_source_user_and_impersonation_target() {
+        let output_directory = tempfile::tempdir().unwrap();
+        let output = output_directory.path().join("gcloud.txt");
+        let script = format!(
+            "echo \"$CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT\" > {out}; \
+             test \"$CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE\" != \"$GOOGLE_APPLICATION_CREDENTIALS\" && \
+             cat \"$CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE\" >> {out}",
+            out = output.display()
+        );
+        let mut profile = profile();
+        profile.impersonate_service_account =
+            Some("deploy@project-a.iam.gserviceaccount.com".into());
+        let status = run_serialized(&shell(script), &profile).unwrap();
+        assert!(status.success());
+
+        let data = std::fs::read_to_string(&output).unwrap();
+        let (target, gcloud_file) = data.split_once('\n').unwrap();
+        assert_eq!(target, "deploy@project-a.iam.gserviceaccount.com");
+        let gcloud_file: serde_json::Value = serde_json::from_str(gcloud_file).unwrap();
+        assert_eq!(gcloud_file["type"], "authorized_user");
+        assert_eq!(gcloud_file["refresh_token"], "refresh-token");
     }
 
     #[test]
@@ -352,7 +389,7 @@ mod tests {
 
         let refresh = refresh_token();
         for file in [
-            temporary_adc(&profile(), &refresh).unwrap(),
+            temporary_json("gcpv-adc-", &credentials::adc(&profile(), &refresh)).unwrap(),
             temporary_boto(&profile(), &refresh).unwrap(),
         ] {
             let mode = file.as_file().metadata().unwrap().permissions().mode() & 0o777;

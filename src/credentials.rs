@@ -36,6 +36,19 @@ pub enum Adc<'a> {
     Impersonated(ImpersonatedAdc<'a>),
 }
 
+pub fn authorized_user<'a>(
+    refresh_token: &'a SecretString,
+    quota_project_id: Option<&'a str>,
+) -> AuthorizedUserAdc<'a> {
+    AuthorizedUserAdc {
+        kind: "authorized_user",
+        client_id: auth::CLIENT_ID,
+        client_secret: auth::CLIENT_SECRET,
+        refresh_token: refresh_token.expose(),
+        quota_project_id,
+    }
+}
+
 pub fn adc<'a>(profile: &'a Profile, refresh_token: &'a SecretString) -> Adc<'a> {
     // With impersonation the quota project belongs on the outer credential.
     let source_quota_project = if profile.impersonate_service_account.is_none() {
@@ -43,13 +56,7 @@ pub fn adc<'a>(profile: &'a Profile, refresh_token: &'a SecretString) -> Adc<'a>
     } else {
         None
     };
-    let source = AuthorizedUserAdc {
-        kind: "authorized_user",
-        client_id: auth::CLIENT_ID,
-        client_secret: auth::CLIENT_SECRET,
-        refresh_token: refresh_token.expose(),
-        quota_project_id: source_quota_project,
-    };
+    let source = authorized_user(refresh_token, source_quota_project);
 
     match &profile.impersonate_service_account {
         Some(service_account) => Adc::Impersonated(ImpersonatedAdc {

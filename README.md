@@ -19,9 +19,9 @@ impersonation.
 - **The right browser and the right identity.** gcpv can match an account to its
   signed-in Chrome profile, accepts an explicit profile override, and verifies
   both the returned email and stable Google subject before storing credentials.
-- **Useful for real development workflows.** Child processes receive a fresh
-  gcloud access token plus renewable ADC for Terraform and Google client
-  libraries. Competing credential variables are scrubbed first.
+- **Useful for real development workflows.** Child processes receive renewable
+  credentials for gcloud, gsutil, bq, Terraform, and Google client libraries.
+  Competing credential variables are scrubbed first.
 
 Google documents both the [refresh token stored in local ADC][local-adc] and
 the fact that [gcloud configurations do not switch local ADC][adc-search].
@@ -134,7 +134,8 @@ remains configured; continue with `gcpv login NAME`.
 |---|---|
 | `GOOGLE_APPLICATION_CREDENTIALS` | Temporary authorized-user or impersonated ADC file |
 | `BOTO_CONFIG` | Temporary boto file for gsutil |
-| `CLOUDSDK_AUTH_ACCESS_TOKEN` | Fresh token for the gcloud CLI |
+| `CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE` | Refreshable user credential file for the gcloud CLI |
+| `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT` | Impersonation target, for impersonated profiles |
 | `CLOUDSDK_CORE_ACCOUNT` | Authenticated user email |
 | `CLOUDSDK_CORE_PROJECT` | Profile project |
 | `GOOGLE_CLOUD_PROJECT`, `GOOGLE_PROJECT`, `GCLOUD_PROJECT` | Profile project |
@@ -155,9 +156,10 @@ Terraform gives that static token precedence over ADC and cannot renew it;
 using the ADC file lets Terraform and other compatible clients refresh their
 credentials during long operations.
 
-The gcloud-specific access token is static and normally lasts about one hour.
-For a shell that remains open longer than that, start a new `gcpv exec` before
-running more gcloud commands.
+gcloud reads the refresh token from its credential file, so it renews access
+tokens and can mint identity tokens (`gcloud auth print-identity-token`) in
+long-lived shells. `CLOUDSDK_AUTH_ACCESS_TOKEN` is removed because a static
+token would expire after about an hour and cannot produce identity tokens.
 
 ## Service account impersonation
 
@@ -172,8 +174,10 @@ through `roles/iam.serviceAccountTokenCreator`, on the target service account.
 The Service Account Credentials API must also be enabled.
 
 The generated ADC uses the `impersonated_service_account` format. Support for
-this credential type varies between Google authentication libraries. The
-injected gcloud access token already belongs to the service account.
+this credential type varies between Google authentication libraries. gcloud
+cannot read that format as a credential file, so it gets a separate file with
+the source user credential and impersonates through
+`CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT`.
 
 ## Chrome profiles
 
@@ -259,11 +263,12 @@ controls][refresh-expiration].
 - Login uses authorization code flow with PKCE, a CSRF state value, a loopback
   callback bound to `127.0.0.1`, verified Google identity data, connection
   limits, and an overall callback deadline.
-- During `exec`, an ADC file and a boto file with restrictive permissions
-  (`0600` on Unix) contain the refresh token so ADC clients and gsutil can
-  renew access tokens. The child process can read and copy that long-lived
+- During `exec`, an ADC file, a boto file, and for impersonated profiles a
+  gcloud credential file, all with restrictive permissions (`0600` on Unix),
+  contain the refresh token so gcloud, gsutil, and ADC clients can renew
+  access tokens. The child process can read and copy that long-lived
   token; only run trusted commands.
-- Both files are deleted after normal child termination and after handled
+- These files are deleted after normal child termination and after handled
   `SIGINT`, `SIGQUIT`, `SIGTERM`, or `SIGHUP`. Terminal-generated `SIGINT` and
   `SIGQUIT` already reach the child through the process group and are not
   relayed a second time; `SIGTERM` and `SIGHUP` sent only to gcpv are relayed

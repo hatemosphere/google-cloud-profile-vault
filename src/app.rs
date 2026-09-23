@@ -90,7 +90,6 @@ pub async fn run(cli: Cli) -> Result<u8> {
                 &credentials.profile,
                 &command,
                 &credentials.refresh_token,
-                &credentials.access_token,
             )?;
             Ok(crate::process::exit_code(status))
         }
