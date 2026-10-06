@@ -200,6 +200,13 @@ profile. If no match is available, it opens the system browser and supplies
 Google's `login_hint`. If the browser cannot be started, the authorization URL
 remains available for manual opening.
 
+Recent macOS versions block other programs from reading browser data, so gcpv
+may be unable to read Chrome's `Local State`. gcpv then prints a warning and
+uses the system browser. Either grant the terminal Full Disk Access (System
+Settings > Privacy & Security), or pass a profile directory name: a directory
+name is handed to Chrome unverified when the metadata cannot be read, while an
+email cannot be resolved and is rejected.
+
 ## Configuration
 
 Non-secret configuration is stored in `~/.config/gcpv/config.toml`
